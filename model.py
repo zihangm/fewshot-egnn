@@ -287,13 +287,54 @@ class GraphNetwork(nn.Module):
             self.add_module('edge2node_net{}'.format(l), edge2node_net)
             self.add_module('node2edge_net{}'.format(l), node2edge_net)
 
+        ### added by zihang
+        self.use_tmd = True
+        if self.use_tmd:
+            L_latent = 16
+            self.pi_list = nn.ModuleList([nn.Sequential(nn.Linear(L_latent, self.node_features),
+                                                        nn.ReLU(),
+                                                        nn.Linear(self.node_features, 1),
+                                                        nn.Sigmoid()) for _ in range(self.num_layers)])
+            self.proj_list = nn.ModuleList([nn.Linear(self.in_features, L_latent)] +
+                                            [nn.Linear(self.node_features, L_latent) for _ in range(self.num_layers-1)])
+            self.dt_0 = nn.Parameter(torch.FloatTensor([0.1]))
+            self.dt_1 = nn.Parameter(torch.FloatTensor([0.1]))
+            self.dt_2 = nn.Parameter(torch.FloatTensor([0.1]))
+            self.dt_3 = nn.Parameter(torch.FloatTensor([0.1]))
+
+    def TMD_map(self, x, idx):
+        # input x if of size [B, d, N]
+        x = self.proj_list[idx](x)
+        # L = construct from pe
+        epsilon = 0.25
+        i_minus_j = x.unsqueeze(2) - x.unsqueeze(1)
+        K_epsilon = torch.exp(-1 / (4 * epsilon) * (i_minus_j ** 2).sum(dim=3))
+        ### construct TMD
+        q_epsilon_tilde = K_epsilon.sum(dim=2)
+        D_epsilon_tilde = torch.diag_embed(self.pi_list[idx](x).squeeze(2) / q_epsilon_tilde)
+        K_tilde = K_epsilon.bmm(D_epsilon_tilde)
+        D_tilde = torch.diag_embed(K_tilde.sum(dim=2) +
+                                   1e-5 * torch.ones(K_tilde.shape[0], K_tilde.shape[1]).to(x.device))
+        L = 1 / epsilon * (torch.inverse(D_tilde).bmm(K_tilde)) - torch.eye(K_tilde.shape[1]).to(
+            x.device).unsqueeze(0).repeat(x.shape[0], 1, 1)
+        return L
+
     # forward
     def forward(self, node_feat, edge_feat):
         # for each layer
         edge_feat_list = []
         for l in range(self.num_layers):
             # (1) edge to node
+            L = self.TMD_map(node_feat, l)
             node_feat = self._modules['edge2node_net{}'.format(l)](node_feat, edge_feat)
+            if self.use_tmd:
+                if l == 0:
+                    dt = self.dt_0
+                elif l ==1:
+                    dt = self.dt_1
+                elif l == 2:
+                    dt = self.dt_2
+                node_feat = (node_feat + dt * torch.matmul(L, node_feat))
 
             # (2) node to edge
             edge_feat = self._modules['node2edge_net{}'.format(l)](node_feat, edge_feat)
